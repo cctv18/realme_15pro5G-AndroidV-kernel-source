@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/syscore_ops.h>
@@ -43,6 +43,10 @@
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_ABNORMAL_FLAG)
 #include <../kernel/oplus_cpu/oplus_overload/task_overload.h>
+#endif
+
+#ifdef CONFIG_HMBIRD_SCHED
+#include <linux/sched/hmbird.h>
 #endif
 
 const char *task_event_names[] = {
@@ -93,7 +97,9 @@ struct irq_work walt_migration_irq_work;
 unsigned int walt_rotation_enabled;
 
 unsigned int __read_mostly sched_ravg_window = 20000000;
-
+#ifdef CONFIG_HMBIRD_SCHED
+EXPORT_SYMBOL(sched_ravg_window);
+#endif
 int min_possible_cluster_id;
 int max_possible_cluster_id;
 /* Initial task load. Newly created tasks are assigned this load. */
@@ -113,6 +119,14 @@ bool walt_is_idle_task(struct task_struct *p)
 	return walt_flag_test(p, WALT_IDLE_TASK_BIT);
 }
 
+#ifdef CONFIG_HMBIRD_SCHED
+struct hmbird_ops *hmbird_ops __read_mostly;
+static void hmbird_sched_ops_init(void)
+{
+	hmbird_ops = get_hmbird_ops(this_rq());
+}
+
+#endif
 
 u64 walt_sched_clock(void)
 {
@@ -869,7 +883,7 @@ finish:
  * In this function we match the accumulated subtractions with the current
  * and previous windows we are operating with. Ignore any entries where
  * the window start in the load_subtraction struct does not match either
- * the curent or the previous window. This could happen whenever CPUs
+ * the current or the previous window. This could happen whenever CPUs
  * become idle or busy with interrupts disabled for an extended period.
  */
 static inline void account_load_subtractions(struct rq *rq)
@@ -1758,11 +1772,29 @@ static bool do_pl_notif(struct rq *rq)
 
 #define CMD_ADD		(1)
 #define CMD_SET		(2)
+#ifdef CONFIG_HMBIRD_SCHED
+static void curr_sum_fixed_set(struct walt_rq *wrq, int cmd, u64 val) {
+	if (CMD_ADD == cmd) {
+		wrq->curr_runnable_sum_fixed += val;
+	} else if (CMD_SET == cmd) {
+		wrq->curr_runnable_sum_fixed = val;
+	} else {}
+}
 
+static u64 curr_sum_fixed(struct walt_rq *wrq) {return wrq->curr_runnable_sum_fixed;}
+
+static void prev_sum_fixed_set(struct walt_rq *wrq, int cmd, u64 val) {
+	if (CMD_ADD == cmd) {
+		wrq->prev_runnable_sum_fixed += val;
+	} else if (CMD_SET == cmd) {
+		wrq->prev_runnable_sum_fixed = val;
+	} else {}
+}
+#else
 static void curr_sum_fixed_set(struct walt_rq *wrq, int cmd, u64 val) {}
 static void prev_sum_fixed_set(struct walt_rq *wrq, int cmd, u64 val) {}
 static u64 curr_sum_fixed(struct walt_rq *wrq) {return 0;}
-
+#endif
 
 static void rollover_cpu_window(struct rq *rq, bool full_window)
 {
@@ -1810,7 +1842,7 @@ static void rollover_cpu_window(struct rq *rq, bool full_window)
  *
  * note irqtime = irq_e - irq_s
  *
- * Similar to the explanation at update_task_demand() we have few sitautions for irqtime
+ * Similar to the explanation at update_task_demand() we have few situations for irqtime
  *
  *              ws   ms_i   is    ie
  *              |    |      |      |
@@ -2112,13 +2144,24 @@ static inline u16 predict_and_update_buckets(
 static int
 account_busy_for_task_demand(struct rq *rq, struct task_struct *p, int event)
 {
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		if (hmbird_ops && hmbird_ops->scx_enable && hmbird_ops->scx_enable()
+				&& (event == PICK_NEXT_TASK || event == TASK_MIGRATE))
+			return 0;
+	}
+#endif
 	/*
 	 * No need to bother updating task demand for the idle task.
 	 */
 	if (walt_is_idle_task(p))
 		return 0;
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		if (SCX_CALL_OP_RET(account_for_runnable_bypass, rq, p, event))
+			return 0;
+	}
+#endif
 	/*
 	 * When a task is waking up it is completing a segment of non-busy
 	 * time. Likewise, if wait time is not treated as busy time, then
@@ -2168,7 +2211,7 @@ static void update_trailblazer_accounting(struct task_struct *p, struct rq *rq,
 	bool is_prev_trailblazer = walt_flag_test(p, WALT_TRAILBLAZER_BIT);
 	u64 trailblazer_capacity;
 
-	if (walt_feat(WALT_FEAT_TRAILBLAZER_BIT) &&
+	if (!pipeline_in_progress() && walt_feat(WALT_FEAT_TRAILBLAZER_BIT) &&
 			(((runtime >= *demand) && (wts->high_util_history >= TRAILBLAZER_THRES)) ||
 			wts->high_util_history >= TRAILBLAZER_BYPASS)) {
 		*trailblazer_demand = 1 << SCHED_CAPACITY_SHIFT;
@@ -2292,7 +2335,12 @@ static void update_history(struct rq *rq, struct task_struct *p,
 
 	wts->demand = demand;
 	wts->demand_scaled = demand_scaled;
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		if (get_hmbird_ts(p))
+			get_hmbird_ts(p)->demand_scaled = demand_scaled;
+	}
+#endif
 	wts->coloc_demand = avg;
 	wts->pred_demand_scaled = pred_demand_scaled;
 
@@ -2530,6 +2578,15 @@ static inline int run_walt_irq_work_rollover(u64 old_window_start, struct rq *rq
 	if (result == old_window_start) {
 		walt_irq_work_queue(&walt_cpufreq_irq_work);
 		trace_walt_window_rollover(wrq->window_start);
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		HMBIRD_CALL_OGKI_OP(window_rollover_run_once, rq);
+	} else if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(window_rollover_run_once, rq);
+	} else {
+		//do nothing,for more version type
+	}
+#endif
 
 		return 1;
 	}
@@ -2574,7 +2631,7 @@ static inline void set_bits(struct walt_task_struct *wts,
  *
  *
  * multiple boundaries between ms and wc,  which case the code accounts for bit
- * until the next_ms_boundary and fills in the interm periods and the leftover from
+ * until the next_ms_boundary and fills in the interim periods and the leftover from
  * the closest is accounted in period
  *
  *  |          ms                        |                       |         wc
@@ -2697,7 +2754,7 @@ static void update_busy_bitmap(struct task_struct *p, struct rq *rq, int event,
 		goto out;
 	}
 
-	/* cpu already boosted, so dont extend */
+	/* cpu already boosted, so don't extend */
 	if (wrq->lrb_pipeline_start_time != 0) {
 		no_boost_reason = 6;
 		goto out;
@@ -2726,7 +2783,7 @@ static void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int even
 		return;
 
 	if (unlikely(!raw_spin_is_locked(&rq->__lock))) {
-		printk_deferred("WALT-BUG CPU%d: %s task %s(%d) unlocked access for cpu=%d suspende=%d last_clk=%llu stack[%pS <== %pS <== %pS]\n",
+		printk_deferred("WALT-BUG CPU%d: %s task %s(%d) unlocked access for cpu=%d suspended=%d last_clk=%llu stack[%pS <== %pS <== %pS]\n",
 				raw_smp_processor_id(), __func__, p->comm, p->pid, rq->cpu,
 				walt_clock_suspended, sched_clock_last,
 				(void *)CALLER_ADDR0, (void *)CALLER_ADDR1, (void *)CALLER_ADDR2);
@@ -2840,7 +2897,12 @@ static void init_new_task_load(struct task_struct *p)
 
 	wts->demand = init_load_windows;
 	wts->demand_scaled = init_load_windows_scaled;
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		if (get_hmbird_ts(p))
+			get_hmbird_ts(p)->demand_scaled = init_load_windows_scaled;
+	}
+#endif
 	wts->coloc_demand = init_load_windows;
 	wts->pred_demand_scaled = 0;
 	for (i = 0; i < RAVG_HIST_SIZE; ++i)
@@ -2876,8 +2938,7 @@ static void walt_task_dead(struct task_struct *p)
 	if (wts->low_latency & WALT_LOW_LATENCY_PIPELINE_BIT)
 		remove_pipeline(wts);
 
-	if (wts->low_latency & WALT_LOW_LATENCY_HEAVY_BIT)
-		remove_heavy(wts);
+	remove_heavy(wts);
 
 	if (p == pipeline_special_task)
 		remove_special_task();
@@ -4391,7 +4452,7 @@ DEFINE_PER_CPU(u32, wakeup_ctr);
  *
  * Process a workqueue call scheduled, while running in a hard irq
  * protected context.  Handle migration and window rollover work
- * with common funtionality, and on window rollover ask core control
+ * with common functionality, and on window rollover ask core control
  * to decide if it needs to adjust the active cpus.
  */
 static void walt_irq_work(struct irq_work *irq_work)
@@ -4478,8 +4539,13 @@ static void walt_irq_work(struct irq_work *irq_work)
 #else
 		qcom_rearrange_pipeline_preferred_cpus(walt_scale_demand_divisor);
 #endif
-		core_ctl_check(wrq->window_start, wakeup_ctr_sum);
-
+#ifdef CONFIG_HMBIRD_SCHED
+		if (HMBIRD_OGKI_VERSION != get_hmbird_version_type() || !(hmbird_ops && hmbird_ops->scx_enable && hmbird_ops->scx_enable())) {
+#endif
+			core_ctl_check(wrq->window_start, wakeup_ctr_sum);
+#ifdef CONFIG_HMBIRD_SCHED
+		}
+#endif
 #if !IS_ENABLED(CONFIG_OPLUS_FEATURE_PIPELINE)
 		pipeline_rearrange(wrq, need_assign_heavy);
 #endif
@@ -4723,8 +4789,16 @@ static void android_rvh_set_task_cpu(void *unused, struct task_struct *p, unsign
 		return;
 
 	migrate_busy_time_subtraction(p, (int) new_cpu);
-
+#ifdef CONFIG_HMBIRD_SCHED
+	/*
+	 * If callback does not registered,
+	 * or check_non_task return true, don't skip.
+	 */
+	if (!cpumask_test_cpu(new_cpu, p->cpus_ptr) && (HMBIRD_OGKI_VERSION != get_hmbird_version_type() || !(hmbird_ops
+		&& hmbird_ops->check_non_task && !hmbird_ops->check_non_task())))
+#else
 	if (!cpumask_test_cpu(new_cpu, p->cpus_ptr))
+#endif
 		WALT_BUG(WALT_BUG_WALT, p, "selecting unaffined cpu=%d comm=%s(%d) affinity=0x%lx",
 			 new_cpu, p->comm, p->pid, (*(cpumask_bits(p->cpus_ptr))));
 
@@ -4798,7 +4872,11 @@ static void android_rvh_enqueue_task(void *unused, struct rq *rq,
 	bool double_enqueue = false;
 	int mid_cluster_cpu;
 
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(enqueue_task, rq, p, 0);
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
@@ -4887,6 +4965,11 @@ static void android_rvh_dequeue_task(void *unused, struct rq *rq,
 	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 	bool double_dequeue = false;
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(dequeue_task, rq, p, 0);
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
@@ -4996,6 +5079,10 @@ static void android_rvh_try_to_wake_up(void *unused, struct task_struct *p)
 	if (unlikely(walt_disabled))
 		return;
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (hmbird_ops && hmbird_ops->scx_enable && hmbird_ops->scx_enable())
+		return;
+#endif
 
 	rq_lock_irqsave(rq, &rf);
 	old_load = task_load(p);
@@ -5064,6 +5151,11 @@ static unsigned long calculate_ipc(int cpu)
 static void android_rvh_tick_entry(void *unused, struct rq *rq)
 {
 	u64 wallclock;
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(tick_entry, rq);
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
@@ -5156,6 +5248,11 @@ static void android_vh_scheduler_tick(void *unused, struct rq *rq)
 		complete(&tick_sched_clock_completion);
 	}
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(scheduler_tick, rq);
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
@@ -5214,10 +5311,25 @@ static void android_rvh_schedule(void *unused, struct task_struct *prev,
 {
 	u64 wallclock;
 	struct walt_task_struct *wts = (struct walt_task_struct *) prev->android_vendor_data1;
+	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
+
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(schedule, prev, next, rq);
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
 	wallclock = walt_rq_clock(rq);
+
+	/*
+	 * reset mvp arrival time as we are switching to non-CFS task
+	 * If rq is already in MVP throttling state then continue with
+	 * throttling until throttling time expires.
+	 */
+	if (!walt_fair_task(next))
+		wrq->mvp_arrival_time = 0;
 
 	if (likely(prev != next)) {
 		if (!prev->on_rq)
@@ -5514,9 +5626,17 @@ static void walt_init_tg_pointers(void)
 	struct cgroup_subsys_state *css = &root_task_group.css;
 	struct cgroup_subsys_state *top_css = css;
 
+#ifdef CONFIG_OPLUS_SCHED_GROUP_OPT
+	oplus_update_tg_map(top_css, true);
+#endif
+
 	rcu_read_lock();
-	css_for_each_child(css, top_css)
+	css_for_each_child(css, top_css) {
 		walt_update_tg_pointer(css);
+#ifdef CONFIG_OPLUS_SCHED_GROUP_OPT
+		oplus_update_tg_map(css, true);
+#endif
+	}
 	rcu_read_unlock();
 }
 
@@ -5605,7 +5725,30 @@ static void walt_init(struct work_struct *work)
 
 	topology_clear_scale_freq_source(SCALE_FREQ_SOURCE_ARCH, cpu_online_mask);
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if(HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		init_hmbird_rq_wrq_variables();
+	}
+#endif
 }
+
+#ifdef CONFIG_HMBIRD_SCHED
+struct scx_sched_gki_ops *scx_sched_ops __read_mostly;
+
+int register_scx_sched_gki_ops(struct scx_sched_gki_ops *ops)
+{
+	if (!ops)
+		return -1;
+
+	if (cmpxchg(&scx_sched_ops, NULL, ops)) {
+		pr_warn("scx_sched_gki_ops has already been registered!\n");
+		return -1;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(register_scx_sched_gki_ops);
+#endif
 
 static DECLARE_WORK(walt_init_work, walt_init);
 static void android_vh_update_topology_flags_workfn(void *unused, void *unused2)
@@ -5631,6 +5774,12 @@ static int walt_module_init(void)
 
 	walt_cpufreq_cycle_cntr_driver_register();
 	walt_gclk_cycle_counter_driver_register();
+
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_OGKI_VERSION == get_hmbird_version_type()) {
+		hmbird_sched_ops_init();
+	}
+#endif
 
 	return 0;
 }

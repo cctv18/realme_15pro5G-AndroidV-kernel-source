@@ -308,6 +308,13 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	int fastpath = NONE;
 	struct cpumask lowest_mask_reduced = { CPU_BITS_NONE };
 	struct walt_task_struct *wts;
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(select_task_rq_rt, task, cpu, sd_flag, wake_flags, new_cpu);
+		if (*new_cpu >= 0)
+			return;
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 
@@ -426,7 +433,13 @@ static void walt_rt_find_lowest_rq(void *unused, struct task_struct *task,
 	int fastpath = 0;
 	struct walt_task_struct *wts;
 	struct cpumask lowest_mask_reduced = { CPU_BITS_NONE };
-
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		SCX_CALL_OP(rt_find_lowest_rq, task, lowest_mask, ret, best_cpu);
+		if (*best_cpu >= 0)
+			return;
+	}
+#endif
 	if (unlikely(walt_disabled))
 		return;
 

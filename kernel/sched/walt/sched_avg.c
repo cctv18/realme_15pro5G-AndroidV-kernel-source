@@ -361,6 +361,13 @@ int sched_lpm_disallowed_time(int cpu, u64 *timeout)
 	u64 now = sched_clock();
 	u64 bias_end_time = atomic64_read(&per_cpu(busy_hyst_end_time, cpu));
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (HMBIRD_GKI_VERSION == get_hmbird_version_type()) {
+		if (!SCX_CALL_OP_RET(sched_lpm_disallowed_time, cpu, timeout))
+			return 0;
+	}
+#endif
+
 	if (unlikely(walt_disabled))
 		return -EAGAIN;
 

@@ -39,6 +39,12 @@ config SCHED_CONSERVATIVE_BOOST_LPM_BIAS
 	  will not enter low power mode for a hysteresis time period,
 	  which can be configured from userspace.
 
+config HMBIRD_SCHED_GKI
+	bool "GKI Support for HMBIRD_SCHED"
+	default n
+	help
+	  Enable GKI Support for HMBIRD_SCHED.
+
 config OPLUS_YIELD_OPT
 	tristate "Enable yield opt"
 	default n

@@ -109,7 +109,9 @@ struct waltgov_cpu {
 };
 
 DEFINE_PER_CPU(struct waltgov_callback *, waltgov_cb_data);
-
+#ifdef CONFIG_HMBIRD_SCHED
+EXPORT_PER_CPU_SYMBOL_GPL(waltgov_cb_data);
+#endif
 static DEFINE_PER_CPU(struct waltgov_cpu, waltgov_cpu);
 static DEFINE_PER_CPU(struct waltgov_tunables *, cached_tunables);
 

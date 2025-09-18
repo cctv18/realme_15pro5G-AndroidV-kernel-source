@@ -17,6 +17,9 @@
 #include <linux/sched/idle.h>
 #if IS_ENABLED(CONFIG_SCHED_WALT)
 #include <linux/sched/walt.h>
+#ifdef CONFIG_HMBIRD_SCHED
+#include <linux/sched/hmbird.h>
+#endif
 #endif
 #include <linux/smp.h>
 #include <linux/spinlock.h>
@@ -76,6 +79,18 @@ static bool lpm_disallowed(s64 sleep_ns, int cpu)
 	if ((sleep_disabled || sleep_ns < 0))
 		return true;
 
+#ifdef CONFIG_HMBIRD_SCHED
+	{
+		int disallow = false;
+		trace_android_vh_scx_sched_lpm_disallowed_time(cpu, &disallow);
+		if (disallow) {
+			cpu_gov->last_idx = 0;
+			cpu_gov->bias = 0;
+			return true;
+		}
+	}
+#endif
+
 #if IS_ENABLED(CONFIG_SCHED_WALT)
 	if (!sched_lpm_disallowed_time(cpu, &bias_time)) {
 		cpu_gov->last_idx = 0;
@@ -85,6 +100,7 @@ static bool lpm_disallowed(s64 sleep_ns, int cpu)
 #endif
 	return false;
 }
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_scx_sched_lpm_disallowed_time);
 
 /**
  * histtimer_fn() - Will be executed when per cpu prediction timer expires
